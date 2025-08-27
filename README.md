@@ -8,4 +8,4 @@ The function implements the ICA-based endogeneity correction by Dost & Haschka (
 - Example: ica_reg(formula = Y ~ endog1 + endog2 + endog3 | exog1 + exog2 + as.factor(exog3), data = data1)
 
 REFERENCES
-- Dost, F. and Haschka, R. E. (2025). XYC. SSRN Working Paper. 
+- Dost, F. and Haschka, R. E. (2025). ICA at the Cocktail Party: Casting Instrument-free Omitted Variable Bias Correction as a Blind Source Separation Problem. Available at SSRN 5361801.
