@@ -1,595 +1,244 @@
+# =============================================================================
+#  ICA-based endogeneity correction with delete-one JACKKNIFE standard errors
+# =============================================================================
+
 # Load required packages
 pacman::p_load(
   nlme,
   dplyr,
   ica,
   Matrix,
-  pbapply
+  pbapply,
+  parallel
 )
 
+# -----------------------------------------------------------------------------
+#  Helper 1: pick the Gaussian source in the FULL sample (most normal column),
+#            via the Kolmogorov-Smirnov distance to normality
+# -----------------------------------------------------------------------------
+select_gaussian_ks <- function(S) {
+  ks <- apply(S, 2, function(x) {
+    suppressWarnings(stats::ks.test(x, "pnorm", mean = mean(x), sd = sd(x))$statistic)
+  })
+  which.min(ks)
+}
 
-boot1 <- function(data, X, f1, f1X, has_intercept, formula, method,
-                  dependent_var, independent_vars, 
-                  independent_P_vars = NA, independent_X_vars = NA) {
+# -----------------------------------------------------------------------------
+#  Helper 2: the core estimator. Runs the WHOLE pipeline once (first-stage OLS
+#            partialling-out of exogenous regressors if present, ICA, control-
+#            function selection, final regression) and returns the coefficient
+#            vector together with the selected control function.
+#
+#  `select_fn(S)` returns the index of the column of the ICA source matrix S that
+#  is to be used as the control function.  In the full sample this is the KS rule;
+#  in a leave-one-out replicate it is correlation-matching to the full-sample source.
+# -----------------------------------------------------------------------------
+ica_fit_core <- function(df, dep, P_rhs, X_rhs, has_exog, has_intercept,
+                         CF, method, select_fn) {
   
-  data <- data[, !colnames(data) %in% c("control_func")]
+  drop_int <- if (!has_intercept) " - 1" else ""
   
-  full_formula <- as.formula(paste(all.vars(formula)[1], "~", 
-                                   gsub("\\|", "+", as.character(formula)[3])))
-  
-  repeat {
+  if (!has_exog) {
     
-    data_cleaned <- data %>%
-      sample_n(size = nrow(data), replace = TRUE)
-    design_matrix <- model.matrix(full_formula, data = data_cleaned)
-    YP <- t(as.matrix(design_matrix))%*%as.matrix(design_matrix)
-    rank_A <- Matrix::rankMatrix(YP)[1]
+    ## ---- No exogenous regressors -------------------------------------------
+    # ICA input = [Y , design matrix of the endogenous part without intercept]
+    Pmm  <- model.matrix(as.formula(paste("~", P_rhs)), data = df)
+    Pcol <- setdiff(colnames(Pmm), "(Intercept)")
+    Pmat <- Pmm[, Pcol, drop = FALSE]
+    Yv   <- df[[dep]]
     
-    if (rank_A == ncol(design_matrix)) { break }
+    ic <- ica::ica(cbind(Yv, Pmat), nc = ncol(Pmat) + 1L, method = method)
+    S  <- ic$S
+    cf <- S[, select_fn(S)]
     
-  }
-  
-  if (length(f1) == 1) {
-    
-    # ICA
-    d1 <- ica::ica(X = data_cleaned2, nc = ncol(data_cleaned2), method = method)
-    d2 <- d1$S
-    
-    # Extract the normal distribution
-    ks_normality <- apply(d2, 2, function(x) {
-      ks_test <- suppressWarnings(stats::ks.test(x, "pnorm", mean = mean(x), sd = sd(x)))
-      return(ks_test$statistic)
-    })
-    
-    control_func <- d2[, which.min(ks_normality)]
-    data_cleaned$control_func <- control_func
-    
-    # Regressions with control function
-    if (!has_intercept) {
-      
-      lm0 <- lm(Formula::as.Formula(formula), data_cleaned)
-      lm1 <- lm(Formula::as.Formula(stats::update.formula(stats::formula(lm0), ~ . 
-                                                          + control_func -1)), 
-                data_cleaned)
-      
+    if (CF) {
+      # Control-function regression:  Y ~ P + control_func
+      reg <- as.data.frame(Pmat)
+      reg[[dep]]        <- Yv
+      reg$control_func  <- cf
+      rhs  <- paste(c(Pcol, "control_func"), collapse = " + ")
+      fit  <- lm(as.formula(paste(dep, "~", rhs, drop_int)), data = reg)
     } else {
-      
-      lm0 <- lm(Formula::as.Formula(formula), data_cleaned)
-      lm1 <- lm(Formula::as.Formula(stats::update.formula(stats::formula(lm0), ~ . 
-                                                          + control_func)), 
-                data_cleaned)
-      
+      # Residualise each endogenous regressor on control_func, then Y ~ P_tilde
+      Pres <- Pmat
+      for (j in seq_len(ncol(Pmat))) Pres[, j] <- residuals(lm(Pmat[, j] ~ cf))
+      reg <- as.data.frame(Pres)
+      reg[[dep]] <- Yv
+      rhs  <- paste(Pcol, collapse = " + ")
+      fit  <- lm(as.formula(paste(dep, "~", rhs, drop_int)), data = reg)
     }
-    
-    Estimates <- lm1$coefficients
     
   } else {
     
-    # first-stage regression for depvar
-    lm_Y <- lm(formula = as.formula(paste(dependent_var, as.character(f1X)[2], sep = " ~ ")), 
-               data = data_cleaned)
-    lm_Y_residuals <- residuals(lm_Y)
+    ## ---- With exogenous regressors -----------------------------------------
+    # First stage: partial X out of Y and of each endogenous regressor (OLS).
+    Xmm  <- model.matrix(as.formula(paste("~", X_rhs)), data = df)
+    qrX  <- qr(Xmm)
+    Yres <- qr.resid(qrX, df[[dep]])
     
-    # first-stage regression for endogs
-    lm_P_residuals <- matrix(nrow = nrow(data_cleaned), 
-                             ncol = length(independent_P_vars))
-    colnames(lm_P_residuals) <- independent_P_vars
+    Pmm  <- model.matrix(as.formula(paste("~", P_rhs)), data = df)
+    Pcol <- setdiff(colnames(Pmm), "(Intercept)")
+    Pmat <- Pmm[, Pcol, drop = FALSE]
+    Pres <- qr.resid(qrX, Pmat)
     
+    # ICA on the first-stage residuals = [Y_res , P_res]
+    ic <- ica::ica(cbind(Yres, Pres), nc = ncol(Pmat) + 1L, method = method)
+    S  <- ic$S
+    cf <- S[, select_fn(S)]
     
-    for (i in seq_along(independent_P_vars)) {
-      
-      p_var <- independent_P_vars[i]
-      
-      formula_P <- as.formula(paste(p_var, "~", paste(independent_X_vars, collapse = " + ")))
-      lm_P <- lm(formula_P, data = data_cleaned)
-      lm_P_residuals[, i] <- residuals(lm_P)
-      
-    }
-    
-    # Apply the ICA on the residuals
-    data_residuals <- cbind(lm_Y_residuals, lm_P_residuals)
-    
-    # ICA
-    d1 <- ica::ica(X = data_residuals, nc = ncol(data_residuals), method = method)
-    d2 <- d1$S
-    
-    # Extract the normal distribution
-    ks_normality <- apply(d2, 2, function(x) {
-      ks_test <- suppressWarnings(stats::ks.test(x, "pnorm", mean = mean(x), sd = sd(x)))
-      return(ks_test$statistic)
-    })
-    
-    control_func <- d2[, which.min(ks_normality)]
-    data_cleaned$control_func <- control_func
-    
-    lm0 <- lm(Formula::as.Formula(formula), data_cleaned)
-    lm1 <- lm(Formula::as.Formula(stats::update.formula(stats::formula(lm0), ~ . 
-                                                        + control_func)), 
-              data_cleaned)
-    
-    Estimates <- lm1$coefficients
-    
-  }
-  
-  return(Estimates)
-  
-}
-boot2 <- function(data, X, f1, f1X, has_intercept, formula, method,
-                  dependent_var, independent_vars, 
-                  independent_P_vars = NA, independent_X_vars = NA) {
-  
-  data <- data[, !colnames(data) %in% c("control_func")]
-  
-  full_formula <- as.formula(paste(all.vars(formula)[1], "~", 
-                                   gsub("\\|", "+", as.character(formula)[3])))
-  
-  repeat {
-    
-    data_cleaned <- data %>%
-      sample_n(size = nrow(data), replace = TRUE)
-    design_matrix <- model.matrix(full_formula, data = data_cleaned)
-    YP <- t(as.matrix(design_matrix))%*%as.matrix(design_matrix)
-    rank_A <- Matrix::rankMatrix(YP)[1]
-    
-    if (rank_A == ncol(design_matrix)) { break }
-    
-  }
-  
-  if (length(f1) == 1) {
-    
-    data_cleaned <- data_cleaned[, c(dependent_var, independent_vars)]
-    
-    # ICA
-    d1 <- ica::ica(X = data_cleaned, nc = ncol(data_cleaned), method = method)
-    d2 <- d1$S
-    
-    # Extract the normal distribution
-    ks_normality <- apply(d2, 2, function(x) {
-      ks_test <- suppressWarnings(stats::ks.test(x, "pnorm", mean = mean(x), sd = sd(x)))
-      return(ks_test$statistic)
-    })
-    
-    control_func <- d2[, which.min(ks_normality)]
-    data_cleaned$control_func <- control_func
-    
-    # first-stage regression for endogs
-    lm_P_residuals <- matrix(nrow = nrow(data_cleaned), 
-                             ncol = length(independent_vars))
-    colnames(lm_P_residuals) <- independent_vars
-    
-    
-    for (i in seq_along(independent_vars)) {
-      
-      p_var <- independent_vars[i]
-      
-      formula_P <- as.formula(paste(p_var, "~", paste("control_func", collapse = " + ")))
-      lm_P <- lm(formula_P, data = data_cleaned)
-      lm_P_residuals[, i] <- residuals(lm_P)
-      
-    }
-    
-    data_cleaned[, independent_vars] <- lm_P_residuals
-    
-    # Regressions
-    if (has_intercept) {
-      
-      lm1 <- lm(formula = as.formula(paste(names(data_cleaned)[1], "~ . -control_func")), data = data_cleaned)
-      
+    if (CF) {
+      # Y ~ P + X + control_func   (X enters as in lm(as.Formula(Y ~ P | X)))
+      reg <- df
+      reg$control_func <- cf
+      rhs <- paste(P_rhs, "+", X_rhs, "+ control_func")
+      fit <- lm(as.formula(paste(dep, "~", rhs, drop_int)), data = reg)
     } else {
-      
-      lm1 <- lm(formula = as.formula(paste(names(data_cleaned)[1], "~ . -1 -control_func")), data = data_cleaned)
-      
+      # Residualise raw endogenous regressors on control_func, then Y ~ P_tilde + X
+      Pcf <- Pmat
+      for (j in seq_len(ncol(Pmat))) Pcf[, j] <- residuals(lm(Pmat[, j] ~ cf))
+      reg <- df
+      reg[, Pcol] <- Pcf
+      rhs <- paste(P_rhs, "+", X_rhs)
+      fit <- lm(as.formula(paste(dep, "~", rhs, drop_int)), data = reg)
     }
-    
-    Estimates <- lm1$coefficients
-    
-  } else {
-    
-    # first-stage regression for depvar
-    lm_Y <- lm(formula = as.formula(paste(dependent_var, as.character(f1X)[2], sep = " ~ ")), 
-               data = data_cleaned)
-    lm_Y_residuals <- residuals(lm_Y)
-    
-    # first-stage regression for endogs
-    lm_P_residuals <- matrix(nrow = nrow(data_cleaned), 
-                             ncol = length(independent_P_vars))
-    colnames(lm_P_residuals) <- independent_P_vars
-    
-    
-    for (i in seq_along(independent_P_vars)) {
-      
-      p_var <- independent_P_vars[i]
-      
-      formula_P <- as.formula(paste(p_var, "~", paste(independent_X_vars, collapse = " + ")))
-      lm_P <- lm(formula_P, data = data_cleaned)
-      lm_P_residuals[, i] <- residuals(lm_P)
-      
-    }
-    
-    # Apply the ICA on the residuals
-    data_residuals <- cbind(lm_Y_residuals, lm_P_residuals)
-    
-    # ICA
-    d1 <- ica::ica(X = data_residuals, nc = ncol(data_residuals), method = method)
-    d2 <- d1$S
-    
-    # Extract the normal distribution
-    ks_normality <- apply(d2, 2, function(x) {
-      ks_test <- suppressWarnings(stats::ks.test(x, "pnorm", mean = mean(x), sd = sd(x)))
-      return(ks_test$statistic)
-    })
-    
-    control_func <- d2[, which.min(ks_normality)]
-    data_cleaned$control_func <- control_func
-    
-    # first-stage regression for endogs
-    lm_P_residuals <- matrix(nrow = nrow(data_cleaned), 
-                             ncol = length(independent_P_vars))
-    colnames(lm_P_residuals) <- independent_P_vars
-    
-    for (i in seq_along(independent_P_vars)) {
-      
-      p_var <- independent_P_vars[i]
-      
-      formula_P <- as.formula(paste(p_var, "~", paste("control_func", collapse = " + ")))
-      lm_P <- lm(formula_P, data = data_cleaned)
-      lm_P_residuals[, i] <- residuals(lm_P)
-      
-    }
-    
-    data_cleaned[, independent_P_vars] <- lm_P_residuals
-    
-    # Regressions
-    if (has_intercept) {
-      
-      lm1 <- lm(formula = as.formula(paste(names(data_cleaned)[1], "~ . -control_func")), data = data_cleaned)
-      
-    } else {
-      
-      lm1 <- lm(formula = as.formula(paste(names(data_cleaned)[1], "~ . -1 -control_func")), data = data_cleaned)
-      
-    }
-    
-    Estimates <- lm1$coefficients
-    
   }
   
-  return(Estimates)
-  
+  list(coef = coef(fit), cf = cf)
 }
 
-ica_reg <- function(formula, data, method = "jade", CF = FALSE, nboots = 199) {
+# -----------------------------------------------------------------------------
+#  Helper 3: one jackknife replicate. Deletes observation i, re-runs the whole
+#            pipeline, and aligns the ICA component by correlation-matching the
+#            replicate sources to the full-sample control function (minus row i).
+# -----------------------------------------------------------------------------
+jack_replicate <- function(i, df, point_cf, fit_args) {
+  df_i   <- df[-i, , drop = FALSE]
+  target <- point_cf[-i]
+  sel    <- function(S) which.max(abs(as.numeric(cor(S, target))))
+  do.call(ica_fit_core, c(list(df = df_i, select_fn = sel), fit_args))$coef
+}
+
+# -----------------------------------------------------------------------------
+#  Main function
+# -----------------------------------------------------------------------------
+ica_reg <- function(formula, data, method = "jade", CF = FALSE,
+                    parallel = FALSE, ncores = NULL, nboots = NULL) {
+  # `nboots` is accepted for backward compatibility but ignored: the delete-one
+  # jackknife uses exactly n replicates and has no tuning parameter.
   
-  # seperate endogenous and exogenous regressor(s)
-  f1 <- nlme::splitFormula(formula, sep = "|")
-  
-  # check if intercept is removed
+  ## ---- parse the formula --------------------------------------------------
+  f1            <- nlme::splitFormula(formula, sep = "|")
   has_intercept <- attr(terms(f1[[1]]), "intercept") == 1
+  has_exog      <- length(f1) > 1
+  dep           <- all.vars(formula)[1]
+  P_rhs         <- paste(deparse(f1[[1]][[2]]), collapse = " ")
+  X_rhs         <- if (has_exog) paste(deparse(f1[[2]][[2]]), collapse = " ") else NULL
   
-  # no exogenous regressors
-  if (length(f1) == 1) {
-    
-    f1P <- f1[[1]]
-    
-    # Check if all variables exist in the data
-    variables <- all.vars(f1P)
-    missing_vars <- setdiff(variables, names(data))
-    if(length(missing_vars) > 0) {
-      
-      stop(paste("The following variables are missing in the data:", 
-                 paste(missing_vars, collapse=", ")))
-      
+  P_vars <- all.vars(f1[[1]])
+  X_vars <- if (has_exog) all.vars(f1[[2]]) else character(0)
+  
+  ## ---- validity checks (as in the original) -------------------------------
+  missing_vars <- setdiff(c(P_vars, X_vars), names(data))
+  if (length(missing_vars) > 0)
+    stop(paste("The following variables are missing in the data:",
+               paste(missing_vars, collapse = ", ")))
+  
+  numeric_P  <- sapply(data[P_vars], is.numeric)
+  if (!all(numeric_P))
+    stop("Only continuous variables can be endogenous. The following are not numeric: ",
+         paste(P_vars[!numeric_P], collapse = ", "))
+  
+  all_chk      <- c(P_vars, X_vars)
+  constant_var <- sapply(data[all_chk], function(x) length(unique(x)) == 1)
+  if (any(constant_var))
+    stop("The following variables are constant: ",
+         paste(all_chk[constant_var], collapse = ", "))
+  
+  ## ---- assemble analysis data frame ---------------------------------------
+  df <- data %>%
+    dplyr::select(dplyr::all_of(c(dep, P_vars, X_vars))) %>%
+    na.omit() %>%
+    as.data.frame()
+  
+  ## ---- full-sample design rank check --------------------------------------
+  full_formula <- as.formula(paste(dep, "~",
+                                   if (has_exog) paste(P_rhs, "+", X_rhs) else P_rhs))
+  dm   <- model.matrix(full_formula, data = df)
+  if (Matrix::rankMatrix(crossprod(dm))[1] != ncol(dm))
+    stop("Design matrix is rank deficient")
+  
+  n        <- nrow(df)
+  fit_args <- list(dep = dep, P_rhs = P_rhs, X_rhs = X_rhs,
+                   has_exog = has_exog, has_intercept = has_intercept,
+                   CF = CF, method = method)
+  
+  ## ---- point estimate (KS selection of the Gaussian source) ---------------
+  point <- do.call(ica_fit_core,
+                   c(list(df = df, select_fn = select_gaussian_ks), fit_args))
+  Estimates    <- point$coef
+  control_func <- point$cf
+  coef_names   <- names(Estimates)
+  
+  ## ---- jackknife standard errors ------------------------------------------
+  message("Estimation done. Calculating jackknife standard errors (", n, " replicates)")
+  
+  cl <- NULL
+  if (parallel) {
+    if (is.null(ncores)) ncores <- max(1L, parallel::detectCores() - 1L)
+    if (.Platform$OS.type == "windows") {
+      # Windows has no forking: build a PSOCK cluster and export the workers' needs.
+      cl <- parallel::makeCluster(ncores)
+      parallel::clusterEvalQ(cl, suppressMessages(library(ica)))
+      parallel::clusterExport(cl, c("ica_fit_core", "jack_replicate"),
+                              envir = environment())
+      on.exit(parallel::stopCluster(cl), add = TRUE)
+    } else {
+      cl <- ncores   # integer => forking via mclapply inside pbsapply (copy-on-write)
     }
-    
-    # Check if all variables are numeric and non-constant
-    numeric_vars <- sapply(data[variables], is.numeric)
-    constant_vars <- sapply(data[variables], function(x) length(unique(x)) == 1)
-    
-    if (!all(numeric_vars)) {
-      stop("The following variables are not numeric: ", paste(variables[!numeric_vars], collapse = ", "))
-    }
-    
-    if (any(constant_vars)) {
-      stop("The following variables are constant: ", paste(variables[constant_vars], collapse = ", "))
-    }
-    
-    dependent_var <- all.vars(formula)[1]
-    independent_vars <- all.vars(f1P)
-    
-    data_cleaned <- data %>%
-      dplyr::select(all_of(c(dependent_var, independent_vars))) %>%
-      na.omit() %>%
-      as.data.frame()
-    
-    # Check if design matrix has full column rank
-    design_matrix <- model.matrix(f1P, data = data_cleaned)
-    YP <- t(as.matrix(design_matrix))%*%as.matrix(design_matrix)
-    rank_A <- Matrix::rankMatrix(YP)[1]
-    
-    if(rank_A != ncol(design_matrix)) {
-      
-      stop(paste("Design matrix is rank deficient"))
-      
-    }
-    
-    # check if intercept is included
-    if (has_intercept) { design_matrix1 <- design_matrix[, -1] } else { 
-      design_matrix1 <- design_matrix }
-    data_cleaned1 <- cbind(data_cleaned[, 1], design_matrix1)
-    colnames(data_cleaned1)[1] <- colnames(data_cleaned)[1]
-    
-    # ICA
-    d1 <- ica::ica(X = data_cleaned1, nc = ncol(data_cleaned1), method = method)
-    d2 <- d1$S
-    
-    # Extract the normal distribution
-    ks_normality <- apply(d2, 2, function(x) {
-      ks_test <- suppressWarnings(stats::ks.test(x, "pnorm", mean = mean(x), sd = sd(x)))
-      return(ks_test$statistic)
-    })
-    
-    control_func <- d2[, which.min(ks_normality)]
-    data_cleaned1 <- as.data.frame(data_cleaned1)
-    data_cleaned1$control_func <- control_func
-    
-    # Control function approach
-    if (CF == TRUE) {
-      
-      # Regression
-      if (has_intercept) {
-        
-        lm1 <- lm(formula = as.formula(paste(names(data_cleaned1)[1], "~ .")), data = data_cleaned1)
-        
-      } else {
-        
-        lm1 <- lm(formula = as.formula(paste(names(data_cleaned1)[1], "~ . -1")), data = data_cleaned1)
-        
-      }
-      
-      Estimates <- lm1$coefficients
-      
-      # Bootstrapping
-      print("Estimation done. calculating bootstrap standard errors")
-      trapped <- pbsapply(1:nboots, function(i) boot1(data = data_cleaned1, X = i, 
-                                                      f1 = f1, has_intercept = has_intercept, 
-                                                      formula = formula, method = method,
-                                                      dependent_var = dependent_var,
-                                                      independent_vars = independent_vars))
-      
-    } else if (CF == FALSE) {
-      
-      # first-stage regression for endogs
-      lm_P_residuals <- matrix(nrow = nrow(data_cleaned), 
-                               ncol = length(independent_vars))
-      colnames(lm_P_residuals) <- independent_vars
-      
-      
-      for (i in seq_along(independent_vars)) {
-        
-        p_var <- independent_vars[i]
-        
-        formula_P <- as.formula(paste(p_var, "~", paste("control_func", collapse = " + ")))
-        lm_P <- lm(formula_P, data = data_cleaned)
-        lm_P_residuals[, i] <- residuals(lm_P)
-        
-      }
-      
-      data_cleaned[, independent_vars] <- lm_P_residuals
-      
-      # Regressions
-      if (has_intercept) {
-        
-        lm1 <- lm(formula = as.formula(paste(names(data_cleaned1)[1], "~ .")), data = data_cleaned)
-        
-      } else {
-        
-        lm1 <- lm(formula = as.formula(paste(names(data_cleaned1)[1], "~ . -1")), data = data_cleaned)
-        
-      }
-      
-      Estimates <- lm1$coefficients
-      
-      # Bootstrapping
-      print("Estimation done. calculating bootstrap standard errors")
-      trapped <- pbsapply(1:nboots, function(i) boot2(data = data, X = i, 
-                                                      f1 = f1, has_intercept = has_intercept, 
-                                                      formula = formula, method = method,
-                                                      dependent_var = dependent_var,
-                                                      independent_vars = independent_vars))
-      
-    }
-    
-    if (is.numeric(trapped)) { ses <- sd(trapped) } else { ses <- apply(trapped, 1, sd) }
-    
-    Estimates1 <- cbind(Estimates, ses)
-    colnames(Estimates1) <- c("Estimate", "Std. Error")
-    
-    ############################################################################
-    
-  } else {
-    
-    f1P <- f1[[1]]
-    f1X <- f1[[2]]
-    
-    variables <- all.vars(f1P)
-    missing_vars <- setdiff(variables, names(data))
-    if(length(missing_vars) > 0) {
-      
-      stop(paste("The following endogenous variables are missing in the data:", 
-                 paste(missing_vars, collapse=", ")))
-      
-    }
-    
-    variables <- all.vars(f1X)
-    missing_vars <- setdiff(variables, names(data))
-    if(length(missing_vars) > 0) {
-      
-      stop(paste("The following exogenous variables are missing in the data:", 
-                 paste(missing_vars, collapse=", ")))
-      
-    }
-    
-    dependent_var <- all.vars(formula)[1]
-    independent_P_vars <- all.vars(f1P)
-    independent_X_vars <- all.vars(f1X)
-    
-    # Check if all variables are numeric and non-constant
-    numeric_vars <- sapply(data[independent_P_vars], is.numeric)
-    constant_vars <- sapply(data[variables], function(x) length(unique(x)) == 1)
-    
-    if (!all(numeric_vars)) {
-      stop("Only continuous variables can be endogenous. The following variables are not numeric: ", paste(variables[!numeric_vars], collapse = ", "))
-    }
-    
-    if (any(constant_vars)) {
-      stop("The following variables are constant: ", paste(variables[constant_vars], collapse = ", "))
-    }
-    
-    # all variables
-    data_cleaned <- data %>%
-      dplyr::select(all_of(c(dependent_var, independent_P_vars, independent_X_vars))) %>%
-      na.omit() %>%
-      as.data.frame()
-    
-    # Check if design matrix has full column rank
-    full_formula <- as.formula(paste(all.vars(formula)[1], "~", 
-                                     gsub("\\|", "+", as.character(formula)[3])))
-    
-    design_matrix <- model.matrix(full_formula, data = data_cleaned)
-    
-    YP <- t(as.matrix(design_matrix))%*%as.matrix(design_matrix)
-    rank_A <- Matrix::rankMatrix(YP)[1]
-    
-    if(rank_A != ncol(design_matrix)) {
-      
-      stop(paste("Design matrix is rank deficient"))
-      
-    }
-    
-    # first-stage regression for depvar
-    lm_Y <- lm(formula = as.formula(paste(dependent_var, as.character(f1X)[2], sep = " ~ ")), 
-               data = data_cleaned)
-    lm_Y_residuals <- residuals(lm_Y)
-    
-    # first-stage regression for endogs
-    lm_P_residuals <- matrix(nrow = nrow(data_cleaned), 
-                             ncol = length(independent_P_vars))
-    colnames(lm_P_residuals) <- independent_P_vars
-    
-    for (i in seq_along(independent_P_vars)) {
-      
-      p_var <- independent_P_vars[i]
-      
-      formula_P <- as.formula(paste(p_var, "~", paste(independent_X_vars, collapse = " + ")))
-      lm_P <- lm(formula_P, data = data_cleaned)
-      lm_P_residuals[, i] <- residuals(lm_P)
-      
-    }
-    
-    # Apply the ICA on the residuals
-    data_residuals <- cbind(lm_Y_residuals, lm_P_residuals)
-    
-    # ICA
-    d1 <- ica::ica(X = data_residuals, nc = ncol(data_residuals), method = method)
-    d2 <- d1$S
-    
-    # Extract the normal distribution
-    ks_normality <- apply(d2, 2, function(x) {
-      ks_test <- suppressWarnings(stats::ks.test(x, "pnorm", mean = mean(x), sd = sd(x)))
-      return(ks_test$statistic)
-    })
-    
-    control_func <- d2[, which.min(ks_normality)]
-    data_cleaned$control_func <- control_func
-    
-    # Control function approach
-    if (CF == TRUE) {
-      
-      # Regressions with control function
-      lm0 <- lm(Formula::as.Formula(formula), data_cleaned)
-      lm1 <- lm(Formula::as.Formula(stats::update.formula(stats::formula(lm0), ~ . 
-                                                          + control_func)), 
-                data_cleaned)
-      Estimates <- lm1$coefficients
-      
-      # Bootstrapping
-      print("Estimation done. calculating bootstrap standard errors")
-      trapped <- pbsapply(1:nboots, function(i) boot1(data = data_cleaned, X = i, f1X = f1X,
-                                                      f1 = f1, has_intercept = has_intercept, 
-                                                      formula = formula, method = method,
-                                                      dependent_var = dependent_var, 
-                                                      independent_X_vars = independent_X_vars,
-                                                      independent_P_vars = independent_P_vars))
-      
-    } else if (CF == FALSE) {
-      
-      # first-stage regression for endogs
-      lm_P_residuals <- matrix(nrow = nrow(data_cleaned), 
-                               ncol = length(independent_P_vars))
-      colnames(lm_P_residuals) <- independent_P_vars
-      
-      for (i in seq_along(independent_P_vars)) {
-        
-        p_var <- independent_P_vars[i]
-        
-        formula_P <- as.formula(paste(p_var, "~", paste("control_func", collapse = " + ")))
-        lm_P <- lm(formula_P, data = data_cleaned)
-        lm_P_residuals[, i] <- residuals(lm_P)
-        
-      }
-      
-      data_cleaned[, independent_P_vars] <- lm_P_residuals
-      
-      # Regressions
-      if (has_intercept) {
-        
-        lm1 <- lm(formula = as.formula(paste(names(data_cleaned)[1], "~ . -control_func")), data = data_cleaned)
-        
-      } else {
-        
-        lm1 <- lm(formula = as.formula(paste(names(data_cleaned)[1], "~ . -1 -control_func")), data = data_cleaned)
-        
-      }
-      
-      Estimates <- lm1$coefficients
-      
-      # Bootstrapping
-      print("Estimation done. calculating bootstrap standard errors")
-      trapped <- pbsapply(1:nboots, function(i) boot2(data = data_cleaned, X = i, f1X = f1X,
-                                                      f1 = f1, has_intercept = has_intercept, 
-                                                      formula = formula, method = method,
-                                                      dependent_var = dependent_var, 
-                                                      independent_X_vars = independent_X_vars,
-                                                      independent_P_vars = independent_P_vars))
-      
-    }
-    
-    ses <- apply(trapped, 1, sd)
-    
-    Estimates1 <- cbind(Estimates, ses)
-    colnames(Estimates1) <- c("Estimate", "Std. Error")
-    
   }
   
-  ##############################################################################
+  reps <- pbapply::pbsapply(
+    seq_len(n),
+    function(i) jack_replicate(i, df, point_cf = control_func, fit_args = fit_args),
+    cl = cl
+  )
   
-  # Identification checks
+  ## ---- assemble jackknife variance ----------------------------------------
+  if (is.list(reps)) {
+    # A replicate returned a different coefficient set (e.g. a factor level
+    # vanished under deletion). Align by name, fill gaps with NA, and warn.
+    reps <- sapply(reps, function(v) {
+      out <- setNames(rep(NA_real_, length(coef_names)), coef_names)
+      out[names(v)] <- v
+      out
+    })
+    warning("Some jackknife replicates produced a different set of coefficients ",
+            "(a factor level may have dropped under deletion); aligned by name.",
+            call. = FALSE)
+  }
+  if (is.null(dim(reps))) reps <- matrix(reps, nrow = 1,
+                                         dimnames = list(coef_names, NULL))
+  reps      <- reps[coef_names, , drop = FALSE]
+  theta_bar <- rowMeans(reps, na.rm = TRUE)
+  V_jk      <- (n - 1) / n * rowSums((reps - theta_bar)^2, na.rm = TRUE)
+  ses       <- sqrt(V_jk)
+  
+  Estimates1 <- cbind(Estimates, ses)
+  colnames(Estimates1) <- c("Estimate", "Std. Error")
+  
+  ## ---- identification diagnostics (as in the original) --------------------
   ks_test1 <- suppressWarnings(stats::ks.test(control_func, "pnorm"))
-  warning_flag <- any(duplicated(control_func))
-  
-  if (ks_test1$p.value< .1) {warning("Joint component may not be normally distributed: Kolmogorov-Smirnov p = ", 
-                                     paste(ks_test1$p.value, 
-                                           collapse = ""), call. = FALSE)}
-  
-  if (warning_flag) {warning("Endogenous regressors contain ties (repeated values)", 
-                             call. = FALSE)}
+  if (ks_test1$p.value < .1)
+    warning("Joint component may not be normally distributed: Kolmogorov-Smirnov p = ",
+            ks_test1$p.value, call. = FALSE)
+  if (any(duplicated(control_func)))
+    warning("Endogenous regressors contain ties (repeated values)", call. = FALSE)
   
   return(list(Estimates1, control_func))
-  
 }
 
 
-### Simulated data
+### Simulated data -----------------------------------------------------------
 
 N <- 100
 testdata <- as.data.frame(matrix(NA, nrow = N, ncol = 0))
@@ -608,30 +257,28 @@ testdata$Y <- 2 + testdata$z1 + testdata$z2 + testdata$x1 + testdata$x2 + testda
 
 mod1 <- ica_reg(formula = Y ~ z1 + z2, data = testdata)
 
+mod1[[1]]        # estimates with jackknife standard errors
+hist(mod1[[2]])  # control function
 
-mod1[[1]] # estimates
-hist(mod1[[2]]) # control function
 
-
-### 1. Real world data example
+### 1. Real world data example -----------------------------------------------
 
 library(AER)
 
-data1 <- data("CPS1988")
 data1 <- CPS1988
 data1$lwage <- log(data1$wage)
 data1$experience_sq <- data1$experience^2
 
-
-mod1 <- lm(lwage ~ education + experience + experience_sq + ethnicity + smsa + region + parttime, 
+mod1 <- lm(lwage ~ education + experience + experience_sq + ethnicity + smsa + region + parttime,
            data1)
+# n ~ 28k => 28k re-estimations; run in parallel
 mod2 <- ica_reg(lwage ~ education | experience + experience_sq + ethnicity + smsa + region + parttime,
-                data = data1)
+                data = data1, parallel = TRUE)
 mod2[[1]]
 hist(mod2[[2]])
 
 
-### 2. Real world data example
+### 2. Real world data example -----------------------------------------------
 
 library(ISLR)
 
@@ -643,7 +290,6 @@ dat1$lprice <- log(dat1$Price)
 dat1$lcompprice <- log(dat1$CompPrice)
 dat1 <- subset(dat1, is.finite(log(Sales)))
 
-
 mod1 <- lm(lsales ~ lprice + lcompprice + ShelveLoc + Income + Advertising + Population + Age + Education + Urban + US,
            dat1)
 mod2 <- ica_reg(lsales ~ lprice + lcompprice | ShelveLoc + Income + Advertising + Population + Age + Education + Urban + US,
@@ -652,23 +298,22 @@ mod2[[1]]
 hist(mod2[[2]])
 
 
-### 3. Real world data example
+### 3. Real world data example -----------------------------------------------
 
 library(mlbench)
 
 data("BostonHousing")
 dat1 <- BostonHousing
 
-
-mod1 <- lm(medv ~ crim + zn + indus + chas + nox + rm + age + dis + rad + tax + 
+mod1 <- lm(medv ~ crim + zn + indus + chas + nox + rm + age + dis + rad + tax +
              ptratio + b + lstat, dat1)
-mod2 <- ica_reg(medv ~ crim + zn + indus | chas + nox + rm + age + dis + rad + tax + 
+mod2 <- ica_reg(medv ~ crim + zn + indus | chas + nox + rm + age + dis + rad + tax +
                   ptratio + b + lstat, data = dat1)
 mod2[[1]]
 hist(mod2[[2]])
 
 
-### 4. Real world example
+### 4. Real world example ----------------------------------------------------
 
 library(bayesm)
 # https://www.rdocumentation.org/packages/bayesm/versions/3.1-6/topics/orangeJuice
@@ -684,15 +329,14 @@ dat1 %>%
   arrange(desc(total_sales)) %>%
   slice(1)
 
-dat111 <- dat1 %>% filter(store == 111) %>% filter(brand == 4) %>% 
+dat111 <- dat1 %>% filter(store == 111) %>% filter(brand == 4) %>%
   mutate(across(starts_with("price"), log)) # Tropicana
 
-
-mod0 <- lm(logmove ~ price4 + price1 + price2 + price3 + price4 + price5 + 
+mod0 <- lm(logmove ~ price4 + price1 + price2 + price3 + price4 + price5 +
              price6 + price7 + price8 + price9 + price10 + price11 + deal + feat,
            dat111)
-mod1 <- ica_reg(formula = logmove ~ price4 | price1 + price2 + price3 + 
-                  price4 + price5 + price6 + price7 + price8 + price9 + 
+mod1 <- ica_reg(formula = logmove ~ price4 | price1 + price2 + price3 +
+                  price4 + price5 + price6 + price7 + price8 + price9 +
                   price10 + price11 + deal + feat, data = dat111)
 mod1[[1]]
 hist(mod1[[2]])
@@ -706,40 +350,40 @@ dat1 %>%
   arrange(desc(total_profit)) %>%
   slice(1)
 
-dat124 <- dat1 %>% filter(store == 124) %>% filter(brand == 4) %>% 
+dat124 <- dat1 %>% filter(store == 124) %>% filter(brand == 4) %>%
   mutate(across(starts_with("price"), log)) # Tropicana
 
-mod0 <- lm(logmove ~ price4 + price1 + price2 + price3 + price4 + price5 + 
+mod0 <- lm(logmove ~ price4 + price1 + price2 + price3 + price4 + price5 +
              price6 + price7 + price8 + price9 + price10 + price11 + deal + feat,
            dat124)
-mod1 <- ica_reg(formula = logmove ~ price4 | price1 + price2 + price3 + 
-                  price4 + price5 + price6 + price7 + price8 + price9 + 
+mod1 <- ica_reg(formula = logmove ~ price4 | price1 + price2 + price3 +
+                  price4 + price5 + price6 + price7 + price8 + price9 +
                   price10 + price11 + deal + feat, data = dat124)
 mod1[[1]]
 hist(mod1[[2]])
 
 
-# all stores
-dat_all <- dat1 %>% filter(brand == 4) %>% mutate(across(starts_with("price"), 
+# all stores (large n => parallel recommended)
+dat_all <- dat1 %>% filter(brand == 4) %>% mutate(across(starts_with("price"),
                                                          log)) # Tropicana
-mod0 <- lm(logmove ~ price4 + price1 + price2 + price3 + price4 + price5 + 
+mod0 <- lm(logmove ~ price4 + price1 + price2 + price3 + price4 + price5 +
              price6 + price7 + price8 + price9 + price10 + price11 + deal + feat,
            dat_all)
-mod1 <- ica_reg(formula = logmove ~ price4 | price1 + price2 + price3 + 
-                  price4 + price5 + price6 + price7 + price8 + price9 + 
-                  price10 + price11 + deal + feat, data = dat_all)
+mod1 <- ica_reg(formula = logmove ~ price4 | price1 + price2 + price3 +
+                  price4 + price5 + price6 + price7 + price8 + price9 +
+                  price10 + price11 + deal + feat, data = dat_all, parallel = TRUE)
 mod1[[1]]
 hist(mod1[[2]])
 
-mod2 <- ica_reg(formula = logmove ~ price4 + price1 + price2 + price3 + 
-                  price4 + price5 + price6 + price7 + price8 + price9 + 
-                  price10 + price11 | deal + feat, data = dat_all)
+mod2 <- ica_reg(formula = logmove ~ price4 + price1 + price2 + price3 +
+                  price4 + price5 + price6 + price7 + price8 + price9 +
+                  price10 + price11 | deal + feat, data = dat_all, parallel = TRUE)
 mod2[[1]]
 hist(mod2[[2]])
 
-mod3 <- ica_reg(formula = logmove ~ price4 + price1 + price2 + price3 + 
-                  price4 + price5 + price6 + price7 + price8 + price9 + 
-                  price10 + price11 | deal + feat + as.factor(week), data = dat_all)
+mod3 <- ica_reg(formula = logmove ~ price4 + price1 + price2 + price3 +
+                  price4 + price5 + price6 + price7 + price8 + price9 +
+                  price10 + price11 | deal + feat + as.factor(week), data = dat_all,
+                parallel = TRUE)
 mod3[[1]]
 hist(mod3[[2]])
-
