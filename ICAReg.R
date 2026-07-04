@@ -265,7 +265,7 @@ hist(mod1[[2]])  # control function
 
 library(AER)
 
-                                   data("CPS1988")
+data("CPS1988")
 data1 <- CPS1988
 data1$lwage <- log(data1$wage)
 data1$experience_sq <- data1$experience^2
