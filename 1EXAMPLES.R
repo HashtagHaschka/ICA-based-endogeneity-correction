@@ -65,7 +65,6 @@ pacman::p_load(dplyr, AER, ISLR, mlbench, bayesm)
 ##  structural equation, so OLS is biased. True coefficients: intercept 2,
 ##  z1 = 1, z2 = 1, x1 = 1, x2 = 1.
 
-set.seed(1)
 N <- 100
 
 testdata <- as.data.frame(matrix(NA, nrow = N, ncol = 0))
