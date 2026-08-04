@@ -56,7 +56,7 @@
 ##  USAGE
 ##
 ##    IcaReg(formula, data, method = "jade", CF = FALSE,
-##           select = c("kurtosis", "ks"), kurt_tol = 1,
+##           select = c("kurtosis", "ks"), kurt_tol = 1, se = TRUE,
 ##           parallel = FALSE, ncores = NULL)
 ##
 ##
@@ -96,6 +96,12 @@
 ##            A warning is issued if its absolute excess kurtosis exceeds this
 ##            value, i.e. if no source looks Gaussian at all. Default 1.
 ##
+##  se        TRUE (default) computes delete-one jackknife standard errors.
+##            FALSE returns the coefficients only and reports NA in the standard
+##            error column. Since the jackknife refits the model once per
+##            observation, this is roughly n times faster and is useful while
+##            exploring specifications; report results with se = TRUE.
+##
 ##  parallel  compute the jackknife replicates in parallel. Recommended for
 ##            n greater than a few thousand.
 ##
@@ -106,6 +112,7 @@
 ##
 ##  A list with two elements:
 ##    [[1]]  matrix of coefficients and delete-one jackknife standard errors
+##           (the standard error column is NA if se = FALSE)
 ##    [[2]]  the estimated control function, one value per observation
 ##
 ##
@@ -332,7 +339,7 @@ pacman::p_load(
 ## ---- main function ----------------------------------------------------------
 
 IcaReg <- function(formula, data, method = "jade", CF = FALSE,
-                   select = c("kurtosis", "ks"), kurt_tol = 1,
+                   select = c("kurtosis", "ks"), kurt_tol = 1, se = TRUE,
                    parallel = FALSE, ncores = NULL, nboots = NULL) {
 
   ## `nboots` is accepted so that scripts written for earlier versions keep
@@ -455,56 +462,64 @@ IcaReg <- function(formula, data, method = "jade", CF = FALSE,
   coef_names   <- names(Estimates)
 
   ## ---- jackknife standard errors -------------------------------------------
-  message("Estimation done. Calculating jackknife standard errors (", n,
-          " replicates)")
+  if (!isTRUE(se)) {
 
-  cl <- NULL
-  if (parallel) {
-    if (is.null(ncores)) ncores <- max(1L, parallel::detectCores() - 1L)
-    if (.Platform$OS.type == "windows") {
-      ## Windows has no forking: build a PSOCK cluster and export what the
-      ## workers need.
-      cl <- parallel::makeCluster(ncores)
-      parallel::clusterEvalQ(cl, suppressMessages(library(ica)))
-      parallel::clusterExport(cl,
-                              c(".IcaReg_fit", ".IcaReg_jack", ".IcaReg_lang"),
-                              envir = environment())
-      on.exit(parallel::stopCluster(cl), add = TRUE)
-    } else {
-      cl <- ncores   # integer => forking, copy-on-write
+    message("Estimation done. Standard errors skipped (se = FALSE).")
+    ses <- stats::setNames(rep(NA_real_, length(coef_names)), coef_names)
+
+  } else {
+
+    message("Estimation done. Calculating jackknife standard errors (", n,
+            " replicates)")
+
+    cl <- NULL
+    if (parallel) {
+      if (is.null(ncores)) ncores <- max(1L, parallel::detectCores() - 1L)
+      if (.Platform$OS.type == "windows") {
+        ## Windows has no forking: build a PSOCK cluster and export what the
+        ## workers need.
+        cl <- parallel::makeCluster(ncores)
+        parallel::clusterEvalQ(cl, suppressMessages(library(ica)))
+        parallel::clusterExport(cl,
+                                c(".IcaReg_fit", ".IcaReg_jack", ".IcaReg_lang"),
+                                envir = environment())
+        on.exit(parallel::stopCluster(cl), add = TRUE)
+      } else {
+        cl <- ncores   # integer => forking, copy-on-write
+      }
     }
+
+    reps <- pbapply::pbsapply(
+      seq_len(n),
+      function(i) .IcaReg_jack(i, df, point_cf = control_func,
+                               coef_names = coef_names, fit_args = fit_args),
+      cl = cl
+    )
+
+    if (is.null(dim(reps)))
+      reps <- matrix(reps, nrow = length(coef_names),
+                     dimnames = list(coef_names, NULL))
+    reps <- reps[coef_names, , drop = FALSE]
+
+    m_ok     <- rowSums(is.finite(reps))
+    n_failed <- sum(colSums(is.finite(reps)) == 0L)
+
+    if (n_failed > 0)
+      warning(n_failed, " of ", n, " jackknife replicates failed entirely and ",
+              "were dropped from the variance.", call. = FALSE)
+    if (any(m_ok < n & m_ok > 0))
+      warning("Some coefficients are based on fewer than ", n, " replicates ",
+              "(min = ", min(m_ok), "); a factor level may drop under deletion.",
+              call. = FALSE)
+
+    theta_bar <- ifelse(m_ok > 0L, rowSums(reps, na.rm = TRUE) / pmax(m_ok, 1L),
+                        NA_real_)
+    V_jk      <- ifelse(m_ok > 1L,
+                        (m_ok - 1L) / pmax(m_ok, 1L) *
+                          rowSums((reps - theta_bar)^2, na.rm = TRUE),
+                        NA_real_)
+    ses <- sqrt(V_jk)
   }
-
-  reps <- pbapply::pbsapply(
-    seq_len(n),
-    function(i) .IcaReg_jack(i, df, point_cf = control_func,
-                             coef_names = coef_names, fit_args = fit_args),
-    cl = cl
-  )
-
-  if (is.null(dim(reps)))
-    reps <- matrix(reps, nrow = length(coef_names),
-                   dimnames = list(coef_names, NULL))
-  reps <- reps[coef_names, , drop = FALSE]
-
-  m_ok     <- rowSums(is.finite(reps))
-  n_failed <- sum(colSums(is.finite(reps)) == 0L)
-
-  if (n_failed > 0)
-    warning(n_failed, " of ", n, " jackknife replicates failed entirely and ",
-            "were dropped from the variance.", call. = FALSE)
-  if (any(m_ok < n & m_ok > 0))
-    warning("Some coefficients are based on fewer than ", n, " replicates ",
-            "(min = ", min(m_ok), "); a factor level may drop under deletion.",
-            call. = FALSE)
-
-  theta_bar <- ifelse(m_ok > 0L, rowSums(reps, na.rm = TRUE) / pmax(m_ok, 1L),
-                      NA_real_)
-  V_jk      <- ifelse(m_ok > 1L,
-                      (m_ok - 1L) / pmax(m_ok, 1L) *
-                        rowSums((reps - theta_bar)^2, na.rm = TRUE),
-                      NA_real_)
-  ses <- sqrt(V_jk)
 
   Estimates1 <- cbind(Estimates, ses)
   colnames(Estimates1) <- c("Estimate", "Std. Error")
