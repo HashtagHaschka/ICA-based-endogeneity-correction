@@ -1,4 +1,4 @@
-The function implements the ICA-based endogeneity correction by Haschka & Dost (2025). It corrects omitted variable bias without instruments: the response and the endogenous regressors are decomposed by Independent Component Analysis, the one recovered source that is Gaussian estimates the omitted confounder, and that source enters the structural equation as a control function.
+The function implements the ICA-based endogeneity correction by Haschka & Dost (2026). It corrects omitted variable bias without instruments: the response and the endogenous regressors are decomposed by Independent Component Analysis, the one recovered source that is Gaussian estimates the omitted confounder, and that source enters the structural equation as a control function.
 
 The required arguments should be specified as follows:
 
@@ -39,4 +39,4 @@ Further points to note:
 
 REFERENCES
 
-- Haschka, R. E. and F. Dost (2025). ICA at the cocktail party: Casting instrument-free omitted variable bias correction as a blind source separation problem. Available at SSRN 5361801.
+- Haschka, R. E. and F. Dost (2026). Correcting omitted-variable bias without instruments: An ICA-based alternative to Gaussian copula methods. Journal of Marketing Research (available online). DOI: 10.1177/00222437261499336.
